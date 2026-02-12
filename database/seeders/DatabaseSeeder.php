@@ -47,5 +47,7 @@ class DatabaseSeeder extends Seeder
                 'client_id' => $clients->random()->id,
             ]);
         }
+
+        $this->call(CatalogSeeder::class);
     }
 }
