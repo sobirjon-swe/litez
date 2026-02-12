@@ -1,6 +1,9 @@
-# CRM-panel: Vazifalar va eslatmalar REST API
+# LiteZ — CRM + Catalog & Inventory REST API
 
-CRM-panel uchun vazifalar va eslatmalar (Tasks & Reminders) REST API. Menejerlar vazifalar yaratishlari, ularni mijozlarga bog'lashlari, avtomatik eslatmalar olishlari va takrorlanuvchi vazifalarni sozlashlari mumkin.
+Ikki moduldan iborat REST API platforma:
+
+1. **CRM-panel** — Vazifalar va eslatmalar (Tasks & Reminders). Menejerlar vazifalar yaratishlari, ularni mijozlarga bog'lashlari, avtomatik eslatmalar olishlari va takrorlanuvchi vazifalarni sozlashlari mumkin.
+2. **Catalog & Inventory** — Mahsulotlar katalogi va ombor boshqaruvi. Kategoriya daraxti, mahsulotlar CRUD, atributlar, stock adjust va harakat tarixi.
 
 ## Texnologiyalar
 
@@ -82,7 +85,7 @@ Keyin:
 php artisan test
 ```
 
-35 ta test (Unit + Feature) — auth, CRUD, status transitions, recurring, reminders.
+66 ta test (Unit + Feature) — auth, CRUD, status transitions, recurring, reminders, catalog, inventory.
 
 ---
 
@@ -266,39 +269,186 @@ Agar `is_recurring: true` va `recurrence_type` belgilangan vazifa **done** bo'ls
 
 ---
 
+## Catalog & Inventory API
+
+### Arxitektura
+
+Modul tuzilishi (`app/Modules/`) — har bir modul o'z controllerlari, modellari, servislari, requestlari va resurslariga ega. Modullar `ServiceProvider` orqali yuklanadi. Autentifikatsiya talab qilinmaydi.
+
+### Kategoriyalar
+
+#### Kategoriya yaratish
+```
+POST /api/categories
+Content-Type: application/json
+
+{
+  "name": "Elektronika",
+  "description": "Elektron jihozlar",
+  "parent_id": null
+}
+```
+
+Javob (201):
+```json
+{
+  "data": {
+    "id": 1,
+    "name": "Elektronika",
+    "slug": "elektronika",
+    "description": "Elektron jihozlar",
+    "parent_id": null,
+    "is_active": true
+  }
+}
+```
+
+- `slug` — avtomatik `name` dan generatsiya qilinadi. Takrorlanganda increment: `elektronika-1`, `elektronika-2`
+- Kategoriya daraxti **maksimal 3 daraja** (parent → child → grandchild)
+
+#### Kategoriya daraxti
+```
+GET /api/categories
+```
+
+Ichma-ich `children` bilan qaytadi (3 darajagacha).
+
+---
+
+### Mahsulotlar
+
+#### Mahsulot yaratish (atributlar bilan)
+```
+POST /api/products
+Content-Type: application/json
+
+{
+  "name": "Futbolka Classic",
+  "price": 29900,
+  "sku": "TSH-001",
+  "category_id": 1,
+  "is_published": true,
+  "attributes": [
+    { "name": "rang", "value": "qora" },
+    { "name": "o'lcham", "value": "XL" }
+  ]
+}
+```
+
+Javob (201):
+```json
+{
+  "data": {
+    "id": 1,
+    "name": "Futbolka Classic",
+    "slug": "futbolka-classic",
+    "price": "29900.00",
+    "sku": "TSH-001",
+    "is_published": true,
+    "category": { "id": 1, "name": "Elektronika", "slug": "elektronika" },
+    "attributes": [
+      { "id": 1, "name": "rang", "value": "qora" },
+      { "id": 2, "name": "o'lcham", "value": "XL" }
+    ],
+    "stock": { "id": 1, "quantity": 0, "reserved_quantity": 0 }
+  }
+}
+```
+
+- Mahsulot yaratilganda avtomatik `stock` yozuvi ham yaratiladi (quantity: 0)
+- Barcha operatsiya tranzaksiyada bajariladi
+
+#### Mahsulotlar ro'yxati (filtrlar bilan)
+```
+GET /api/products
+GET /api/products?category_id=1
+GET /api/products?price_min=10000&price_max=50000
+GET /api/products?search=futbolka
+```
+
+#### Mahsulot slug bo'yicha
+```
+GET /api/products/{slug}
+```
+
+Atributlar va stock bilan qaytadi.
+
+#### Mahsulotni yangilash
+```
+PUT /api/products/{id}
+Content-Type: application/json
+
+{
+  "name": "Yangilangan nom",
+  "price": 35000,
+  "attributes": [
+    { "name": "rang", "value": "oq" }
+  ]
+}
+```
+
+---
+
+### Ombor (Inventory)
+
+#### Stock miqdorini o'zgartirish
+```
+POST /api/inventory/{product_id}/adjust
+Content-Type: application/json
+
+{
+  "quantity_change": 50,
+  "reason": "receipt"
+}
+```
+
+**Reason qiymatlari:** `receipt` (kirim), `sale` (sotish), `adjustment` (tuzatish), `return` (qaytarish)
+
+- `sale` sababida `reserved_quantity` ortadi, boshqa reasonlar ta'sir qilmaydi
+- Omborda yetarli bo'lmasa — **422** qaytadi:
+
+```json
+{
+  "message": "Omborda yetarli mahsulot yo'q",
+  "errors": {
+    "quantity_change": ["Omborda 50 dona mavjud, 100 dona chiqarib yuborish mumkin emas"]
+  }
+}
+```
+
+#### Harakat tarixi
+```
+GET /api/inventory/{product_id}/history
+```
+
+---
+
 ## Loyiha strukturasi
 
 ```
 app/
-├── Enums/              # PHP 8.1+ Enums
-│   ├── UserRole.php        (manager, admin)
-│   ├── TaskType.php        (call, meeting, email, task)
-│   ├── TaskPriority.php    (low, medium, high, critical)
-│   ├── TaskStatus.php      (pending, in_progress, done, cancelled)
-│   └── RemindVia.php       (email, sms)
-├── Http/
-│   ├── Controllers/Api/
-│   │   ├── AuthController.php
-│   │   ├── TaskController.php
-│   │   └── ClientTaskController.php
-│   ├── Requests/       # Form Request validatsiya
-│   │   ├── RegisterRequest.php
-│   │   ├── LoginRequest.php
-│   │   ├── StoreTaskRequest.php
-│   │   ├── UpdateTaskRequest.php
-│   │   └── UpdateTaskStatusRequest.php
-│   └── Resources/      # API Resource (JSON format)
-│       ├── UserResource.php
-│       ├── ClientResource.php
-│       └── TaskResource.php
-├── Jobs/
-│   └── SendTaskReminderJob.php
-├── Models/
-│   ├── User.php
-│   ├── Client.php
-│   └── Task.php
-├── Notifications/
-│   └── TaskReminderNotification.php
-└── Services/
-    └── TaskService.php     # Biznes logika
+├── Enums/                  # CRM uchun PHP Enums
+├── Http/                   # CRM controllerlari
+├── Jobs/                   # Queue joblari
+├── Models/                 # CRM modellari (User, Client, Task)
+├── Notifications/          # Email/SMS eslatmalar
+├── Services/               # CRM biznes logika
+└── Modules/
+    ├── Catalog/
+    │   ├── CatalogServiceProvider.php
+    │   ├── routes.php
+    │   ├── Controllers/    (CategoryController, ProductController)
+    │   ├── Models/         (Category, Product, ProductAttribute)
+    │   ├── Services/       (CategoryService, ProductService)
+    │   ├── Requests/       (StoreCategoryRequest, StoreProductRequest, UpdateProductRequest)
+    │   └── Resources/      (CategoryResource, ProductResource, ProductAttributeResource)
+    └── Inventory/
+        ├── InventoryServiceProvider.php
+        ├── routes.php
+        ├── Controllers/    (InventoryController)
+        ├── Models/         (Stock, StockMovement)
+        ├── Services/       (InventoryService)
+        ├── Requests/       (AdjustStockRequest)
+        ├── Resources/      (StockResource, StockMovementResource)
+        └── DTOs/           (StockMovementReason enum)
 ```
