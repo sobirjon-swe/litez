@@ -1,9 +1,10 @@
-# LiteZ — CRM + Catalog & Inventory REST API
+# LiteZ — CRM + Catalog & Inventory + Delivery REST API
 
-Ikki moduldan iborat REST API platforma:
+Uchta moduldan iborat REST API platforma:
 
 1. **CRM-panel** — Vazifalar va eslatmalar (Tasks & Reminders). Menejerlar vazifalar yaratishlari, ularni mijozlarga bog'lashlari, avtomatik eslatmalar olishlari va takrorlanuvchi vazifalarni sozlashlari mumkin.
 2. **Catalog & Inventory** — Mahsulotlar katalogi va ombor boshqaruvi. Kategoriya daraxti, mahsulotlar CRUD, atributlar, stock adjust va harakat tarixi.
+3. **Delivery Service** — Yetkazib berish xizmati. Geokodlash, marshrut hisoblash, narxlash, to'lov (webhook + HMAC), SMS/Email bildirishnomalar va tashqi so'rovlar loglash.
 
 ## Texnologiyalar
 
@@ -32,7 +33,7 @@ cp .env.example .env
 php artisan key:generate
 ```
 
-`.env` faylida PostgreSQL ma'lumotlarini to'g'rilang:
+`.env` faylida PostgreSQL va boshqa sozlamalarni to'g'rilang:
 ```
 DB_CONNECTION=pgsql
 DB_HOST=localhost
@@ -40,6 +41,9 @@ DB_PORT=5432
 DB_DATABASE=litez_db
 DB_USERNAME=your_username
 DB_PASSWORD=your_password
+
+# Delivery moduli uchun
+PAYMENT_SECRET_KEY=your-secret-key-here
 ```
 
 ### 4. Ma'lumotlar bazasini yaratish
@@ -56,6 +60,8 @@ Bu quyidagilarni yaratadi:
 - **2 ta foydalanuvchi:** admin@example.com (admin), manager@example.com (manager) — parol: `password`
 - **5 ta mijoz** (client)
 - **Har bir foydalanuvchi uchun:** 5 oddiy, 2 takrorlanuvchi, 2 eslatmali, 1 muddati o'tgan vazifa
+- **Katalog:** kategoriyalar va mahsulotlar
+- **Yetkazib berish:** 15 ta buyurtma turli statuslarda (pending, paid, in_delivery, delivered, cancelled)
 
 ### 6. Serverni ishga tushirish
 ```bash
@@ -85,7 +91,7 @@ Keyin:
 php artisan test
 ```
 
-66 ta test (Unit + Feature) — auth, CRUD, status transitions, recurring, reminders, catalog, inventory.
+90 ta test (Unit + Feature) — auth, CRUD, status transitions, recurring, reminders, catalog, inventory, delivery, webhook HMAC, pricing.
 
 ---
 
@@ -423,6 +429,265 @@ GET /api/inventory/{product_id}/history
 
 ---
 
+## Delivery Service API
+
+Yetkazib berish moduli — geokodlash, marshrut hisoblash, narxlash, to'lov va bildirishnomalar. Autentifikatsiya talab qilinmaydi. Barcha tashqi xizmatlar (geocoder, routing, payment, sms) hozircha **mock** rejimda ishlaydi.
+
+### Manzilni geokodlash
+
+```
+POST /api/addresses/geocode
+Content-Type: application/json
+
+{
+  "address": "Toshkent, Amir Temur ko'chasi 10"
+}
+```
+
+Javob (200):
+```json
+{
+  "lat": 41.3112345,
+  "lng": 69.2798765
+}
+```
+
+> Mock rejimda Toshkent hududidagi tasodifiy koordinatalar qaytariladi.
+
+---
+
+### Marshrut va narxni hisoblash (preview)
+
+Buyurtma yaratmasdan, faqat narxni ko'rish uchun:
+
+```
+POST /api/orders/calculate
+Content-Type: application/json
+
+{
+  "origin_address": "Toshkent, Chorsu bozori",
+  "destination_address": "Toshkent, Sergeli tumani"
+}
+```
+
+Javob (200):
+```json
+{
+  "origin": { "lat": 41.3256, "lng": 69.2312 },
+  "destination": { "lat": 41.2845, "lng": 69.2756 },
+  "distance_km": 7.85,
+  "duration_minutes": 12,
+  "estimated_cost": 11280
+}
+```
+
+**Narx hisoblash formulasi:**
+- Bazaviy narx: **5 000 so'm**
+- Har bir km: **800 so'm**
+- 100 km dan oshsa: **x1.5 koeffitsiyent**
+
+Misol: 10 km = 5000 + (10 × 800) = **13 000 so'm**
+
+---
+
+### Buyurtma yaratish
+
+```
+POST /api/orders
+Content-Type: application/json
+
+{
+  "customer_name": "Ali Valiyev",
+  "customer_phone": "+998901234567",
+  "customer_email": "ali@example.com",
+  "origin_address": "Toshkent, Amir Temur ko'chasi",
+  "destination_address": "Toshkent, Navoi ko'chasi"
+}
+```
+
+Javob (201):
+```json
+{
+  "data": {
+    "id": 1,
+    "customer_name": "Ali Valiyev",
+    "customer_phone": "+998901234567",
+    "customer_email": "ali@example.com",
+    "origin": {
+      "address": "Toshkent, Amir Temur ko'chasi",
+      "lat": "41.3112345",
+      "lng": "69.2798765"
+    },
+    "destination": {
+      "address": "Toshkent, Navoi ko'chasi",
+      "lat": "41.2956789",
+      "lng": "69.2534567"
+    },
+    "distance_km": "5.23",
+    "duration_minutes": 8,
+    "estimated_cost": "9184.00",
+    "status": "pending",
+    "paid_at": null,
+    "created_at": "2026-02-13T10:00:00.000000Z",
+    "updated_at": "2026-02-13T10:00:00.000000Z"
+  }
+}
+```
+
+Buyurtma yaratilganda avtomatik:
+- Ikkala manzil geokodlanadi
+- Marshrut va narx hisoblanadi
+- SMS bildirishnoma jo'natiladi (queue orqali)
+
+**Maydonlar:**
+
+| Maydon | Turi | Tavsif |
+|--------|------|--------|
+| customer_name | required, string | Mijoz ismi |
+| customer_phone | required, string | Telefon raqam |
+| customer_email | required, email | Email manzil |
+| origin_address | required, string | Jo'natish manzili |
+| destination_address | required, string | Yetkazish manzili |
+
+---
+
+### Buyurtmani ko'rish
+
+```
+GET /api/orders/{id}
+```
+
+---
+
+### Buyurtma statusini o'zgartirish
+
+```
+PATCH /api/orders/{id}/status
+Content-Type: application/json
+
+{
+  "status": "in_delivery"
+}
+```
+
+**Ruxsat etilgan o'tishlar:**
+
+| Joriy status | O'tishi mumkin |
+|-------------|---------------|
+| pending | `paid`, `cancelled` |
+| paid | `in_delivery`, `cancelled` |
+| in_delivery | `delivered`, `cancelled` |
+| delivered | — (terminal) |
+| cancelled | — (terminal) |
+
+Noto'g'ri o'tish (masalan pending → delivered):
+```json
+{
+  "message": "...",
+  "errors": {
+    "status": ["Cannot transition from pending to delivered."]
+  }
+}
+```
+
+Status o'zgarganda:
+- Har safar SMS bildirishnoma yuboriladi
+- `delivered` bo'lganda qo'shimcha **email** yuboriladi (queue orqali)
+
+---
+
+### To'lovni boshlash
+
+```
+POST /api/orders/{id}/pay
+```
+
+Faqat `pending` statusdagi buyurtmalar uchun ishlaydi.
+
+Javob (200):
+```json
+{
+  "payment_url": "https://mock-payment.example.com/pay/txn_AbCdEfGh12345678",
+  "transaction_id": "txn_AbCdEfGh12345678"
+}
+```
+
+> Mock rejimda soxta payment URL qaytariladi.
+
+---
+
+### Payment Webhook
+
+To'lov tizimi buyurtma to'langanini tasdiqlash uchun webhook yuboradi:
+
+```
+POST /api/webhooks/payment
+Content-Type: application/json
+X-Signature: {hmac_sha256_imzo}
+
+{
+  "order_id": 1,
+  "amount": 13000
+}
+```
+
+**HMAC-SHA256 imzo yaratish:**
+
+Imzo `X-Signature` headerda yuboriladi. Uni quyidagicha hisoblash kerak:
+
+```
+signature = HMAC-SHA256(JSON.stringify(payload), PAYMENT_SECRET_KEY)
+```
+
+PHP da:
+```php
+$signature = hash_hmac('sha256', json_encode($payload), env('PAYMENT_SECRET_KEY'));
+```
+
+curl bilan test qilish:
+```bash
+# O'zgaruvchilar
+SECRET="your-secret-key-here"
+PAYLOAD='{"order_id":1,"amount":13000}'
+SIGNATURE=$(echo -n "$PAYLOAD" | openssl dgst -sha256 -hmac "$SECRET" | awk '{print $2}')
+
+# So'rov
+curl -X POST http://127.0.0.1:8000/api/webhooks/payment \
+  -H "Content-Type: application/json" \
+  -H "X-Signature: $SIGNATURE" \
+  -d "$PAYLOAD"
+```
+
+Muvaffaqiyatli javob (200): buyurtma `paid` statusga o'tadi va `paid_at` belgilanadi.
+
+Noto'g'ri imzo: **403 Forbidden**
+
+---
+
+### Tashqi so'rovlar logi
+
+Barcha tashqi xizmatlarga (geocoder, routing, payment, sms) yuborilgan so'rovlar `external_request_logs` jadvaliga avtomatik yoziladi. Har bir yozuv quyidagilarni saqlaydi:
+
+| Maydon | Tavsif |
+|--------|--------|
+| service | Xizmat nomi (geocoder, routing, payment, sms) |
+| method | HTTP metod (GET, POST) |
+| url | So'rov URL |
+| request_body | Yuborilgan ma'lumot (JSON) |
+| response_body | Qaytgan javob (JSON) |
+| status_code | HTTP status kod |
+| duration_ms | So'rov davomiyligi (millisekund) |
+
+---
+
+### SMS va Email bildirishnomalar
+
+- **SMS** — buyurtma yaratilganda, status o'zgarganda va to'langanda yuboriladi. Mock rejimda `storage/logs/sms.log` ga yoziladi.
+- **Email** — faqat `delivered` statusda yuboriladi. Mail driver `log` rejimda `storage/logs/laravel.log` ga yoziladi.
+- Barcha bildirishnomalar **queue** orqali yuboriladi — `php artisan queue:work` ishlayotgan bo'lishi kerak.
+
+---
+
 ## Loyiha strukturasi
 
 ```
@@ -442,13 +707,26 @@ app/
     │   ├── Services/       (CategoryService, ProductService)
     │   ├── Requests/       (StoreCategoryRequest, StoreProductRequest, UpdateProductRequest)
     │   └── Resources/      (CategoryResource, ProductResource, ProductAttributeResource)
-    └── Inventory/
-        ├── InventoryServiceProvider.php
+    ├── Inventory/
+    │   ├── InventoryServiceProvider.php
+    │   ├── routes.php
+    │   ├── Controllers/    (InventoryController)
+    │   ├── Models/         (Stock, StockMovement)
+    │   ├── Services/       (InventoryService)
+    │   ├── Requests/       (AdjustStockRequest)
+    │   ├── Resources/      (StockResource, StockMovementResource)
+    │   └── DTOs/           (StockMovementReason enum)
+    └── Delivery/
+        ├── DeliveryServiceProvider.php
         ├── routes.php
-        ├── Controllers/    (InventoryController)
-        ├── Models/         (Stock, StockMovement)
-        ├── Services/       (InventoryService)
-        ├── Requests/       (AdjustStockRequest)
-        ├── Resources/      (StockResource, StockMovementResource)
-        └── DTOs/           (StockMovementReason enum)
+        ├── Enums/          (OrderStatus)
+        ├── Contracts/      (GeocoderInterface, RoutingInterface, PaymentInterface, SmsNotificationInterface)
+        ├── DTOs/           (GeoPoint, RouteResult, PaymentResult)
+        ├── Controllers/    (AddressController, OrderController, PaymentWebhookController)
+        ├── Models/         (Order, ExternalRequestLog)
+        ├── Services/       (OrderService, PricingService, MockGeocoder/Routing/Payment/Sms, ExternalRequestLogger)
+        ├── Requests/       (GeocodeRequest, CalculateRouteRequest, StoreOrderRequest, UpdateOrderStatusRequest)
+        ├── Resources/      (OrderResource, ExternalRequestLogResource)
+        ├── Jobs/           (SendOrderSmsJob, SendOrderEmailJob)
+        └── Notifications/  (OrderDeliveredNotification)
 ```
